@@ -99,7 +99,7 @@ var (
 
 const (
 	delayWhenError = time.Second * 10 // Agent 重连间隔
-	networkTimeOut = time.Second * 5  // 普通网络超时
+	networkTimeOut = time.Second * 10 // 普通网络超时
 )
 
 func init() {
@@ -246,12 +246,12 @@ func run() {
 
 	retry := func() {
 		initialized = false
-		println("Error to close connection ...")
+		println("关闭连接时出错 ...")
 		if conn != nil {
 			conn.Close()
 		}
 		time.Sleep(delayWhenError)
-		println("Try to reconnect ...")
+		println("尝试重新连接 ...")
 	}
 
 	for {
@@ -430,7 +430,7 @@ func reportState(lastReportHostInfo time.Time) time.Time {
 		_, err := client.ReportSystemState(timeOutCtx, monitor.GetState(agentCliParam.SkipConnectionCount, agentCliParam.SkipProcsCount).PB())
 		cancel()
 		if err != nil {
-			printf("reportState error: %v", err)
+			printf("报告状态 错误: %v", err)
 			time.Sleep(delayWhenError)
 		}
 		// 每10分钟重新获取一次硬件信息
