@@ -338,7 +338,7 @@ func runService(action string, flags []string) {
 
 	if action == "install" {
 		initName := s.Platform()
-		println("Init system is:", initName)
+		println("Init 系统是:", initName)
 	}
 
 	if len(action) != 0 {
