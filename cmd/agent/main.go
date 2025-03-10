@@ -6,12 +6,17 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"github.com/blang/semver"
+	"github.com/gookit/slog"
+	"github.com/gookit/slog/handler"
+	"github.com/nezhahq/go-github-selfupdate/selfupdate"
 	"io"
 	"log"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
+	"path"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -31,7 +36,7 @@ import (
 	"google.golang.org/grpc/resolver"
 
 	"github.com/nezhahq/agent/model"
-	fm "github.com/nezhahq/agent/pkg/fm"
+	"github.com/nezhahq/agent/pkg/fm"
 	"github.com/nezhahq/agent/pkg/monitor"
 	"github.com/nezhahq/agent/pkg/processgroup"
 	"github.com/nezhahq/agent/pkg/pty"
@@ -103,6 +108,21 @@ const (
 )
 
 func init() {
+	//slog注册
+	h1 := handler.MustRotateFile(
+		path.Join(path.Join("./", "agent.log")),
+		handler.EveryHour,                     //每小时切割
+		handler.WithLogLevels(slog.AllLevels), //设置日志级别
+		handler.WithBuffSize(0),
+		handler.WithCompress(true),       //压缩
+		handler.WithMaxSize(1024*1024*3), //最大10M
+		handler.WithBackupTime(24*3),     //备份15天
+	)
+	slog.PushHandler(h1)
+	slog.Configure(func(logger *slog.SugaredLogger) {
+		f := logger.Formatter.(*slog.TextFormatter)
+		f.EnableColor = true
+	})
 	resolver.SetDefaultScheme("passthrough")
 	net.DefaultResolver.PreferGo = true // 使用 Go 内置的 DNS 解析器解析域名
 	net.DefaultResolver.Dial = func(ctx context.Context, network, address string) (net.Conn, error) {
@@ -113,7 +133,7 @@ func init() {
 		if len(agentConfig.DNS) > 0 {
 			dnsServers = agentConfig.DNS
 		}
-		index := int(time.Now().Unix()) % int(len(dnsServers))
+		index := int(time.Now().Unix()) % len(dnsServers)
 		queue := generateQueue(index, len(dnsServers))
 		var conn net.Conn
 		var err error
@@ -166,7 +186,7 @@ func init() {
 
 func main() {
 	if err := agentCmd.Execute(); err != nil {
-		println(err)
+		slog.Error(err)
 		os.Exit(1)
 	}
 }
@@ -176,7 +196,8 @@ func persistPreRun(cmd *cobra.Command, args []string) {
 	if runtime.GOOS == "windows" {
 		hostArch, err := host.KernelArch()
 		if err != nil {
-			panic(err)
+			slog.Panic(err)
+			os.Exit(0)
 		}
 		if hostArch == "i386" {
 			hostArch = "386"
@@ -188,7 +209,8 @@ func persistPreRun(cmd *cobra.Command, args []string) {
 			hostArch = "arm64"
 		}
 		if arch != hostArch {
-			panic(fmt.Sprintf("与当前系统不匹配，当前运行 %s_%s, 需要下载 %s_%s", runtime.GOOS, arch, runtime.GOOS, hostArch))
+			slog.Panic("与当前系统不匹配，当前运行", runtime.GOOS, "_", arch, ", 需要下载 ", runtime.GOOS, hostArch)
+			os.Exit(0)
 		}
 	}
 }
@@ -203,12 +225,12 @@ func preRun(cmd *cobra.Command, args []string) {
 	}
 
 	if agentCliParam.ClientSecret == "" {
-		cmd.Help()
+		_ = cmd.Help()
 		os.Exit(1)
 	}
 
 	if agentCliParam.ReportDelay < 1 || agentCliParam.ReportDelay > 4 {
-		println("report-delay 的区间为 1-4")
+		slog.Warn("report-delay 的区间为 1-4")
 		os.Exit(1)
 	}
 }
@@ -222,7 +244,7 @@ func run() {
 	if !agentCliParam.DisableCommandExecute {
 		go func() {
 			if err := pty.DownloadDependency(); err != nil {
-				printf("pty 下载依赖失败: %v", err)
+				slog.Printf("pty 下载依赖失败: %v", err)
 			}
 		}()
 	}
@@ -232,26 +254,26 @@ func run() {
 	go monitor.UpdateIP(agentCliParam.UseIPv6CountryCode, agentCliParam.IPReportPeriod)
 
 	// 定时检查更新
-	// if _, err := semver.Parse(version); err == nil && !agentCliParam.DisableAutoUpdate {
-	// 	doSelfUpdate(true)
-	// 	go func() {
-	// 		for range time.Tick(20 * time.Minute) {
-	// 			doSelfUpdate(true)
-	// 		}
-	// 	}()
-	// }
+	if _, err := semver.Parse(version); err == nil && !agentCliParam.DisableAutoUpdate {
+		doSelfUpdate(true)
+		go func() {
+			for range time.Tick(20 * time.Minute) {
+				doSelfUpdate(true)
+			}
+		}()
+	}
 
 	var err error
 	var conn *grpc.ClientConn
 
 	retry := func() {
 		initialized = false
-		println("关闭连接时出错 ...")
+		slog.Error("关闭连接时出错 ...")
 		if conn != nil {
-			conn.Close()
+			_ = conn.Close()
 		}
 		time.Sleep(delayWhenError)
-		println("尝试重新连接 ...")
+		slog.Warn("尝试重新连接 ...")
 	}
 
 	for {
@@ -267,7 +289,7 @@ func run() {
 		}
 		conn, err = grpc.NewClient(agentCliParam.Server, securityOption, grpc.WithPerRPCCredentials(&auth))
 		if err != nil {
-			printf("与面板建立连接失败: %v", err)
+			slog.Printf("与面板建立连接失败: %v", err)
 			retry()
 			continue
 		}
@@ -276,7 +298,7 @@ func run() {
 		timeOutCtx, cancel := context.WithTimeout(context.Background(), networkTimeOut)
 		_, err = client.ReportSystemInfo(timeOutCtx, monitor.GetHost().PB())
 		if err != nil {
-			printf("上报系统信息失败: %v", err)
+			slog.Printf("上报系统信息失败: %v", err)
 			cancel()
 			retry()
 			continue
@@ -286,12 +308,12 @@ func run() {
 		// 执行 Task
 		tasks, err := client.RequestTask(context.Background(), monitor.GetHost().PB())
 		if err != nil {
-			printf("请求任务失败: %v", err)
+			slog.Printf("请求任务失败: %v", err)
 			retry()
 			continue
 		}
 		err = receiveTasks(tasks)
-		printf("receiveTasks exit to main: %v", err)
+		slog.Printf("receiveTasks exit to main: %v", err)
 		retry()
 	}
 }
@@ -299,7 +321,7 @@ func run() {
 func runService(action string, flags []string) {
 	dir, err := os.Getwd()
 	if err != nil {
-		printf("获取当前工作目录时出错: %s", err)
+		slog.Printf("获取当前工作目录时出错: %s", err)
 		return
 	}
 
@@ -321,7 +343,7 @@ func runService(action string, flags []string) {
 	}
 	s, err := service.New(prg, svcConfig)
 	if err != nil {
-		printf("创建服务时出错，以普通模式运行: %v", err)
+		slog.Printf("创建服务时出错，以普通模式运行: %v", err)
 		run()
 		return
 	}
@@ -330,7 +352,7 @@ func runService(action string, flags []string) {
 	if agentConfig.Debug {
 		serviceLogger, err := s.Logger(nil)
 		if err != nil {
-			printf("获取 service logger 时出错: %+v", err)
+			slog.Printf("获取 service logger 时出错: %+v", err)
 		} else {
 			util.Logger = serviceLogger
 		}
@@ -338,7 +360,7 @@ func runService(action string, flags []string) {
 
 	if action == "install" {
 		initName := s.Platform()
-		println("Init 系统是:", initName)
+		slog.Printf("Init 系统是: %s", initName)
 	}
 
 	if len(action) != 0 {
@@ -351,13 +373,13 @@ func runService(action string, flags []string) {
 
 	err = s.Run()
 	if err != nil {
-		util.Logger.Error(err)
+		_ = util.Logger.Error(err)
 	}
 }
 
 func receiveTasks(tasks pb.NezhaService_RequestTaskClient) error {
 	var err error
-	defer printf("receiveTasks exit %v => %v", time.Now(), err)
+	defer slog.Printf("receiveTasks exit %v => %v", time.Now(), err)
 	for {
 		var task *pb.Task
 		task, err = tasks.Recv()
@@ -367,7 +389,7 @@ func receiveTasks(tasks pb.NezhaService_RequestTaskClient) error {
 		go func() {
 			defer func() {
 				if err := recover(); err != nil {
-					println("task panic", task, err)
+					slog.Printf("task panic:任务 %s ,错误: %s", task, err)
 				}
 			}()
 			doTask(task)
@@ -388,8 +410,8 @@ func doTask(task *pb.Task) {
 		handleTcpPingTask(task, &result)
 	case model.TaskTypeCommand:
 		handleCommandTask(task, &result)
-	// case model.TaskTypeUpgrade:
-	// 	handleUpgradeTask(task, &result)
+	case model.TaskTypeUpgrade:
+		handleUpgradeTask(task, &result)
 	case model.TaskTypeTerminalGRPC:
 		handleTerminalTask(task)
 		return
@@ -405,17 +427,17 @@ func doTask(task *pb.Task) {
 	case model.TaskTypeKeepalive:
 		return
 	default:
-		printf("不支持的任务: %v", task)
+		slog.Printf("不支持的任务: %v", task)
 		return
 	}
-	client.ReportTask(context.Background(), &result)
+	_, _ = client.ReportTask(context.Background(), &result)
 }
 
 // reportStateDaemon 向server上报状态信息
 func reportStateDaemon() {
 	var lastReportHostInfo time.Time
 	var err error
-	defer printf("reportState exit %v => %v", time.Now(), err)
+	defer slog.Printf("reportState exit %v => %v", time.Now(), err)
 	for {
 		// 为了更准确的记录时段流量，inited 后再上传状态信息
 		lastReportHostInfo = reportState(lastReportHostInfo)
@@ -430,7 +452,7 @@ func reportState(lastReportHostInfo time.Time) time.Time {
 		_, err := client.ReportSystemState(timeOutCtx, monitor.GetState(agentCliParam.SkipConnectionCount, agentCliParam.SkipProcsCount).PB())
 		cancel()
 		if err != nil {
-			printf("报告状态 错误: %v", err)
+			slog.Printf("报告状态 错误: %v", err)
 			time.Sleep(delayWhenError)
 		}
 		// 每10分钟重新获取一次硬件信息
@@ -450,7 +472,7 @@ func reportHost() bool {
 	defer hostStatus.Store(false)
 
 	if client != nil && initialized {
-		client.ReportSystemInfo(context.Background(), monitor.GetHost().PB())
+		_, _ = client.ReportSystemInfo(context.Background(), monitor.GetHost().PB())
 		if monitor.GeoQueryIP != "" {
 			geoip, err := client.LookupGeoIP(context.Background(), &pb.GeoIP{Ip: monitor.GeoQueryIP})
 			if err == nil {
@@ -462,36 +484,37 @@ func reportHost() bool {
 	return true
 }
 
-// // doSelfUpdate 执行更新检查 如果更新成功则会结束进程
-// func doSelfUpdate(useLocalVersion bool) {
-// 	v := semver.MustParse("0.1.0")
-// 	if useLocalVersion {
-// 		v = semver.MustParse(version)
-// 	}
-// 	printf("检查更新: %v", v)
-// 	var latest *selfupdate.Release
-// 	var err error
-// 	if monitor.CachedCountryCode != "cn" && !agentCliParam.UseGiteeToUpgrade {
-// 		latest, err = selfupdate.UpdateSelf(v, "nezhahq/agent")
-// 	} else {
-// 		latest, err = selfupdate.UpdateSelfGitee(v, "naibahq/agent")
-// 	}
-// 	if err != nil {
-// 		printf("更新失败: %v", err)
-// 		return
-// 	}
-// 	if !latest.Version.Equals(v) {
-// 		printf("已经更新至: %v, 正在结束进程", latest.Version)
-// 		os.Exit(1)
-// 	}
-// }
+// doSelfUpdate 执行更新检查 如果更新成功则会结束进程
+func doSelfUpdate(useLocalVersion bool) {
+	v := semver.MustParse("0.1.0")
+	if useLocalVersion {
+		v = semver.MustParse(version)
+	}
+	slog.Printf("检查更新: %v", v)
+	var latest *selfupdate.Release
+	var err error
+	if monitor.CachedCountryCode != "cn" && !agentCliParam.UseGiteeToUpgrade {
+		latest, err = selfupdate.UpdateSelf(v, "lishaosongs/nezhaAgent")
+	} else {
+		//没有gitee源暂时就不使用gitee
+		latest, err = selfupdate.UpdateSelf(v, "lishaosongs/nezhaAgent")
+	}
+	if err != nil {
+		slog.Printf("更新失败: %v", err)
+		return
+	}
+	if !latest.Version.Equals(v) {
+		slog.Printf("已经更新至: %v, 正在结束进程", latest.Version)
+		os.Exit(1)
+	}
+}
 
-// func handleUpgradeTask(*pb.Task, *pb.TaskResult) {
-// 	if agentCliParam.DisableForceUpdate {
-// 		return
-// 	}
-// 	doSelfUpdate(false)
-// }
+func handleUpgradeTask(*pb.Task, *pb.TaskResult) {
+	if agentCliParam.DisableForceUpdate {
+		return
+	}
+	doSelfUpdate(false)
+}
 
 func handleTcpPingTask(task *pb.Task, result *pb.TaskResult) {
 	if agentCliParam.DisableSendQuery {
@@ -512,7 +535,7 @@ func handleTcpPingTask(task *pb.Task, result *pb.TaskResult) {
 	if strings.Contains(ipAddr, ":") {
 		ipAddr = fmt.Sprintf("[%s]", ipAddr)
 	}
-	printf("TCP-Ping Task: Pinging %s:%s", ipAddr, port)
+	slog.Printf("TCP-Ping Task: Pinging %s:%s", ipAddr, port)
 	start := time.Now()
 	conn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%s", ipAddr, port), time.Second*10)
 	if err != nil {
@@ -535,7 +558,7 @@ func handleIcmpPingTask(task *pb.Task, result *pb.TaskResult) {
 		result.Data = err.Error()
 		return
 	}
-	printf("ICMP-Ping Task: Pinging %s", ipAddr)
+	slog.Printf("ICMP-Ping Task: Pinging %s", ipAddr)
 	pinger, err := ping.NewPinger(ipAddr)
 	if err == nil {
 		pinger.SetPrivileged(true)
@@ -570,7 +593,12 @@ func handleHttpGetTask(task *pb.Task, result *pb.TaskResult) {
 
 func checkHttpResp(taskUrl string, start time.Time, resp *http.Response, err error, result *pb.TaskResult) {
 	if err == nil {
-		defer resp.Body.Close()
+		defer func(Body io.ReadCloser) {
+			err := Body.Close()
+			if err != nil {
+				slog.Printf("HTTP Body Close 错误: %v", err)
+			}
+		}(resp.Body)
 		_, err = io.Copy(io.Discard, resp.Body)
 	}
 	if err == nil {
@@ -672,13 +700,13 @@ func handleCommandTask(task *pb.Task, result *pb.TaskResult) {
 		result.Data = err.Error()
 		return
 	}
-	pg.AddProcess(cmd)
+	_ = pg.AddProcess(cmd)
 	go func() {
 		select {
 		case <-timeout.C:
 			result.Data = "任务执行超时\n"
 			close(endCh)
-			pg.Dispose()
+			_ = pg.Dispose()
 		case <-endCh:
 			timeout.Stop()
 		}
@@ -690,7 +718,7 @@ func handleCommandTask(task *pb.Task, result *pb.TaskResult) {
 		result.Data = b.String()
 		result.Successful = true
 	}
-	pg.Dispose()
+	_ = pg.Dispose()
 	result.Delay = float32(time.Since(startedAt).Seconds())
 }
 
@@ -701,19 +729,19 @@ type WindowSize struct {
 
 func handleTerminalTask(task *pb.Task) {
 	if agentCliParam.DisableCommandExecute {
-		println("此 Agent 已禁止命令执行")
+		slog.Warn("此 Agent 已禁止命令执行")
 		return
 	}
 	var terminal model.TerminalTask
 	err := util.Json.Unmarshal([]byte(task.GetData()), &terminal)
 	if err != nil {
-		printf("Terminal 任务解析错误: %v", err)
+		slog.Printf("Terminal 任务解析错误: %v", err)
 		return
 	}
 
 	remoteIO, err := client.IOStream(context.Background())
 	if err != nil {
-		printf("Terminal IOStream失败: %v", err)
+		slog.Printf("Terminal IOStream失败: %v", err)
 		return
 	}
 
@@ -734,20 +762,20 @@ func handleTerminalTask(task *pb.Task) {
 	defer func() {
 		err := tty.Close()
 		errCloseSend := remoteIO.CloseSend()
-		println("terminal exit", terminal.StreamID, err, errCloseSend)
+		slog.Warn("terminal exit", terminal.StreamID, err, errCloseSend)
 	}()
-	println("terminal init", terminal.StreamID)
+	slog.Warn("terminal init", terminal.StreamID)
 
 	go func() {
 		for {
 			buf := make([]byte, 10240)
 			read, err := tty.Read(buf)
 			if err != nil {
-				remoteIO.Send(&pb.IOStreamData{Data: []byte(err.Error())})
-				remoteIO.CloseSend()
+				_ = remoteIO.Send(&pb.IOStreamData{Data: []byte(err.Error())})
+				_ = remoteIO.CloseSend()
 				return
 			}
-			remoteIO.Send(&pb.IOStreamData{Data: buf[:read]})
+			_ = remoteIO.Send(&pb.IOStreamData{Data: buf[:read]})
 		}
 	}()
 
@@ -761,7 +789,7 @@ func handleTerminalTask(task *pb.Task) {
 		}
 		switch remoteData.Data[0] {
 		case 0:
-			tty.Write(remoteData.Data[1:])
+			_, _ = tty.Write(remoteData.Data[1:])
 		case 1:
 			decoder := util.Json.NewDecoder(strings.NewReader(string(remoteData.Data[1:])))
 			var resizeMessage WindowSize
@@ -769,27 +797,27 @@ func handleTerminalTask(task *pb.Task) {
 			if err != nil {
 				continue
 			}
-			tty.Setsize(resizeMessage.Cols, resizeMessage.Rows)
+			_ = tty.Setsize(resizeMessage.Cols, resizeMessage.Rows)
 		}
 	}
 }
 
 func handleNATTask(task *pb.Task) {
 	if agentCliParam.DisableNat {
-		println("此 Agent 已禁止内网穿透")
+		slog.Warn("此 Agent 已禁止内网穿透")
 		return
 	}
 
 	var nat model.TaskNAT
 	err := util.Json.Unmarshal([]byte(task.GetData()), &nat)
 	if err != nil {
-		printf("NAT 任务解析错误: %v", err)
+		slog.Printf("NAT 任务解析错误: %v", err)
 		return
 	}
 
 	remoteIO, err := client.IOStream(context.Background())
 	if err != nil {
-		printf("NAT IOStream失败: %v", err)
+		slog.Printf("NAT IOStream失败: %v", err)
 		return
 	}
 
@@ -797,33 +825,33 @@ func handleNATTask(task *pb.Task) {
 	if err := remoteIO.Send(&pb.IOStreamData{Data: append([]byte{
 		0xff, 0x05, 0xff, 0x05,
 	}, []byte(nat.StreamID)...)}); err != nil {
-		printf("NAT 发送StreamID失败: %v", err)
+		slog.Printf("NAT 发送StreamID失败: %v", err)
 		return
 	}
 
 	conn, err := net.Dial("tcp", nat.Host)
 	if err != nil {
-		printf("NAT Dial %s 失败：%s", nat.Host, err)
+		slog.Printf("NAT Dial %s 失败：%s", nat.Host, err)
 		return
 	}
 
 	defer func() {
 		err := conn.Close()
 		errCloseSend := remoteIO.CloseSend()
-		println("NAT exit", nat.StreamID, err, errCloseSend)
+		slog.Warn("NAT exit", nat.StreamID, err, errCloseSend)
 	}()
-	println("NAT init", nat.StreamID)
+	slog.Warn("NAT init", nat.StreamID)
 
 	go func() {
 		buf := make([]byte, 10240)
 		for {
 			read, err := conn.Read(buf)
 			if err != nil {
-				remoteIO.Send(&pb.IOStreamData{Data: []byte(err.Error())})
-				remoteIO.CloseSend()
+				_ = remoteIO.Send(&pb.IOStreamData{Data: []byte(err.Error())})
+				_ = remoteIO.CloseSend()
 				return
 			}
-			remoteIO.Send(&pb.IOStreamData{Data: buf[:read]})
+			_ = remoteIO.Send(&pb.IOStreamData{Data: buf[:read]})
 		}
 	}()
 
@@ -832,25 +860,25 @@ func handleNATTask(task *pb.Task) {
 		if remoteData, err = remoteIO.Recv(); err != nil {
 			return
 		}
-		conn.Write(remoteData.Data)
+		_, _ = conn.Write(remoteData.Data)
 	}
 }
 
 func handleFMTask(task *pb.Task) {
 	if agentCliParam.DisableCommandExecute {
-		println("此 Agent 已禁止命令执行")
+		slog.Warn("此 Agent 已禁止命令执行")
 		return
 	}
 	var fmTask model.TaskFM
 	err := util.Json.Unmarshal([]byte(task.GetData()), &fmTask)
 	if err != nil {
-		printf("FM 任务解析错误: %v", err)
+		slog.Printf("FM 任务解析错误: %v", err)
 		return
 	}
 
 	remoteIO, err := client.IOStream(context.Background())
 	if err != nil {
-		printf("FM IOStream失败: %v", err)
+		slog.Printf("FM IOStream失败: %v", err)
 		return
 	}
 
@@ -858,15 +886,15 @@ func handleFMTask(task *pb.Task) {
 	if err := remoteIO.Send(&pb.IOStreamData{Data: append([]byte{
 		0xff, 0x05, 0xff, 0x05,
 	}, []byte(fmTask.StreamID)...)}); err != nil {
-		printf("FM 发送StreamID失败: %v", err)
+		slog.Printf("FM 发送StreamID失败: %v", err)
 		return
 	}
 
 	defer func() {
 		errCloseSend := remoteIO.CloseSend()
-		println("FM exit", fmTask.StreamID, nil, errCloseSend)
+		slog.Warn("FM exit", fmTask.StreamID, nil, errCloseSend)
 	}()
-	println("FM init", fmTask.StreamID)
+	slog.Warn("FM init", fmTask.StreamID)
 
 	fmc := fm.NewFMClient(remoteIO, printf)
 	for {
@@ -879,10 +907,6 @@ func handleFMTask(task *pb.Task) {
 		}
 		fmc.DoTask(remoteData)
 	}
-}
-
-func println(v ...interface{}) {
-	util.Println(agentConfig.Debug, v...)
 }
 
 func printf(format string, v ...interface{}) {
