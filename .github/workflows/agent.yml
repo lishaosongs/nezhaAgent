@@ -1,4 +1,4 @@
-name: Build + Release
+name: 构建 + 发布
 
 on:
   push:
@@ -8,9 +8,6 @@ on:
       - main
     paths-ignore:
       - ".github/workflows/agent.yml"
-      - ".github/workflows/codeql-analysis.yml"
-      - ".github/workflows/test.yml"
-      - ".github/workflows/contributors.yml"
       - "README.md"
       - ".goreleaser.yml"
   pull_request:
@@ -22,30 +19,10 @@ jobs:
     strategy:
       fail-fast: true
       matrix:
-        goos: [linux, windows, darwin, freebsd]
-        goarch: [amd64, arm64, 386]
-        include:
-          - goos: linux
-            goarch: 386
-          - goos: linux
-            goarch: s390x
-          - goos: linux
-            goarch: riscv64
-          - goos: linux
-            goarch: arm
-          - goos: linux
-            goarch: mips
-            gomips: softfloat
-          - goos: linux
-            goarch: mipsle
-            gomips: softfloat
-          - goos: freebsd
-            goarch: arm
-        exclude:
-          - goos: darwin
-            goarch: 386
+        goos: [linux, windows]
+        goarch: [amd64, 386]
 
-    name: Build artifacts
+    name: 生成工件
     runs-on: ubuntu-latest
     env:
       GOOS: ${{ matrix.goos }}
@@ -56,12 +33,12 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Set up Go
+      - name: 设置 Go
         uses: actions/setup-go@v5
         with:
-          go-version: "1.22"
+          go-version: "1.22.11"
 
-      - name: Build Test
+      - name: 构建测试
         if: github.event_name != 'push' || !contains(github.ref, 'refs/tags/')
         uses: goreleaser/goreleaser-action@v6
         with:
@@ -69,7 +46,7 @@ jobs:
           version: '~> v2'
           args: build --single-target --clean --snapshot
 
-      - name: Build
+      - name: 构建
         if: github.event_name == 'push' && contains(github.ref, 'refs/tags/')
         uses: goreleaser/goreleaser-action@v6
         with:
@@ -77,7 +54,7 @@ jobs:
           version: '~> v2'
           args: build --single-target --clean
 
-      - name: Archive
+      - name: 存档
         run: zip -jr dist/nezha-agent_${GOOS}_${GOARCH}.zip dist/*/*
 
       - name: Upload artifacts
@@ -93,7 +70,7 @@ jobs:
     needs: build
     name: Release
     steps:
-      - name: Download artifacts
+      - name: 下载项目
         uses: actions/download-artifact@v4
         with:
           path: ./assets
@@ -107,10 +84,8 @@ jobs:
           artifacts: "checksums.txt,assets/*/*.zip"
           generateReleaseNotes: true
 
-      - name: Trigger sync
+      - name: 触发同步
         env:
-          GH_REPO: ${{ github.repository }}
           GH_TOKEN: ${{ github.token }}
-          GH_DEBUG: api
         run: |
           gh workflow run sync-release.yml
