@@ -1,91 +1,32 @@
-name: 构建 + 发布
+name: goreleaser
 
 on:
   push:
+    # 仅针对标记运行
     tags:
-      - "v*"
-    branches:
-      - main
-    paths-ignore:
-      - ".github/workflows/agent.yml"
-      - "README.md"
-      - ".goreleaser.yml"
-  pull_request:
-    branches:
-      - main
+      - 'v*'
+
+permissions:
+  contents: write
+  # packages: write
+  # issues: write
 
 jobs:
-  build:
-    strategy:
-      fail-fast: true
-      matrix:
-        goos: [linux, windows]
-        goarch: [amd64, 386]
-
-    name: 生成工件
+  goreleaser:
     runs-on: ubuntu-latest
-    env:
-      GOOS: ${{ matrix.goos }}
-      GOARCH: ${{ matrix.goarch }}
-      GOMIPS: ${{ matrix.gomips }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v3
         with:
           fetch-depth: 0
-
-      - name: 设置 Go
-        uses: actions/setup-go@v5
+      - run: git fetch --force --tags
+      - uses: actions/setup-go@v3
         with:
-          go-version: "1.22.11"
-
-      - name: 构建测试
-        if: github.event_name != 'push' || !contains(github.ref, 'refs/tags/')
-        uses: goreleaser/goreleaser-action@v6
+          go-version: '1.21.11'
+          cache: true
+      - uses: goreleaser/goreleaser-action@v5
         with:
           distribution: goreleaser
-          version: '~> v2'
-          args: build --single-target --clean --snapshot
-
-      - name: 构建
-        if: github.event_name == 'push' && contains(github.ref, 'refs/tags/')
-        uses: goreleaser/goreleaser-action@v6
-        with:
-          distribution: goreleaser
-          version: '~> v2'
-          args: build --single-target --clean
-
-      - name: 存档
-        run: zip -jr dist/nezha-agent_${GOOS}_${GOARCH}.zip dist/*/*
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: nezha-agent_${{ env.GOOS }}_${{ env.GOARCH }}
-          path: |
-            ./dist/nezha-agent_${{ env.GOOS }}_${{ env.GOARCH }}.zip
-
-  release:
-    runs-on: ubuntu-latest
-    if: github.event_name == 'push' && contains(github.ref, 'refs/tags/')
-    needs: build
-    name: Release
-    steps:
-      - name: 下载项目
-        uses: actions/download-artifact@v4
-        with:
-          path: ./assets
-
-      - name: Checksum
-        run: sha256sum ./assets/*/*.zip | awk -F" |/" '{print $1, $NF}' > checksums.txt
-
-      - name: Release
-        uses: ncipollo/release-action@v1
-        with:
-          artifacts: "checksums.txt,assets/*/*.zip"
-          generateReleaseNotes: true
-
-      - name: 触发同步
+          version: latest
+          args: release --clean
         env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          gh workflow run sync-release.yml
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
