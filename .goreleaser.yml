@@ -17,6 +17,7 @@ builds:
       - linux
     goarch:
       - "amd64"
+      - "386"
     main: ./cmd/agent
 archives:
   - format: tar.gz
